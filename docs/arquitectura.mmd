@@ -1,0 +1,46 @@
+flowchart LR
+    SRC[("ClickHouse StackOverflow<br/>Parquet publico (S3 HTTPS)")]
+
+    subgraph MANUAL["Flujo manual (una vez)"]
+        PREP["prepare_bronze_manual<br/>pyarrow streaming"]
+        SPOST["silver_post_hist_manual<br/>Spark + MERGE"]
+    end
+
+    subgraph AIRFLOW["Airflow - DAG stackoverflow_medallion (un solo Play)"]
+        T1["1. bronze_ingest<br/>dlt"] --> T2["2. silver_transform<br/>Spark MERGE"] --> T3["3. gold_agg<br/>Spark MERGE"]
+    end
+
+    subgraph SPARK["Spark standalone (master + worker)"]
+        SP["Jobs PySpark<br/>(modo client)"]
+    end
+
+    subgraph MINIO["MinIO (S3)"]
+        B[("bronze/<br/>Parquet - overwrite<br/>post_2020, post_2021,<br/>users_2020, users_2021")]
+        S[("silver/<br/>Iceberg<br/>post_hist, users_hist")]
+        G[("gold/<br/>Iceberg<br/>cant_post_x_user_hist")]
+    end
+
+    NESSIE["Nessie<br/>catalogo Iceberg<br/>(persistente)"]
+    PG[("PostgreSQL<br/>version store de Nessie<br/>+ metadatos de Airflow")]
+    JUP["Jupyter<br/>notebooks de respaldo"]
+    TRINO["Trino<br/>replica Gold desde Silver"]
+    DREMIO["Dremio<br/>consulta Gold"]
+    DBV["DBeaver"]
+
+    SRC -->|"posts 2020/2021, users 2020"| PREP --> B
+    SRC -->|"users 2021"| T1 --> B
+    B -->|"post_2020/2021"| SPOST --> S
+    T2 -.->|"submit"| SP
+    T3 -.->|"submit"| SP
+    B --> SP
+    SP -->|"MERGE INTO"| S
+    SP -->|"MERGE INTO"| G
+    SP <-->|"metadatos"| NESSIE
+    NESSIE --- PG
+    JUP -.->|"mismos 3 scripts"| SP
+    S --> TRINO
+    G --> DREMIO
+    TRINO <-->|"catalogo"| NESSIE
+    DREMIO <-->|"catalogo"| NESSIE
+    TRINO --> DBV
+    DREMIO --> DBV

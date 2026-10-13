@@ -1,0 +1,12 @@
+# Spark standalone master/worker image with Iceberg, Nessie and S3 (MinIO) support.
+# Java 17 matches the JRE used by the Airflow driver.
+FROM apache/spark:3.5.5-scala2.12-java17-python3-ubuntu
+
+# JARs are baked at build time so executors never download dependencies at runtime.
+ARG MAVEN=https://repo1.maven.org/maven2
+ADD --chmod=644 ${MAVEN}/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.5.0/iceberg-spark-runtime-3.5_2.12-1.5.0.jar /opt/spark/jars/
+ADD --chmod=644 ${MAVEN}/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.77.1/nessie-spark-extensions-3.5_2.12-0.77.1.jar /opt/spark/jars/
+ADD --chmod=644 ${MAVEN}/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar /opt/spark/jars/
+ADD --chmod=644 ${MAVEN}/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar /opt/spark/jars/
+ADD --chmod=644 ${MAVEN}/software/amazon/awssdk/bundle/2.24.8/bundle-2.24.8.jar /opt/spark/jars/
+ADD --chmod=644 ${MAVEN}/software/amazon/awssdk/url-connection-client/2.24.8/url-connection-client-2.24.8.jar /opt/spark/jars/

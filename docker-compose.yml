@@ -1,0 +1,386 @@
+# Proyecto 2 - FHBD - Grupo 2: Lakehouse Medallion (Bronze/Silver/Gold) sobre StackOverflow
+#
+# MinIO (S3) + Nessie (catalogo persistente, JDBC/Postgres) + Iceberg + Spark standalone
+# + Airflow (LocalExecutor) + dlt + Jupyter + Trino + Dremio.
+#
+# WARNING: local development setup only. Credentials are intentionally simple (see README).
+#
+#   docker compose build
+#   docker compose up -d
+name: g2-lakehouse
+
+x-s3-credentials: &s3-credentials
+  AWS_ACCESS_KEY_ID: admin
+  AWS_SECRET_ACCESS_KEY: password
+  AWS_REGION: us-east-1
+  AWS_DEFAULT_REGION: us-east-1
+
+x-lake-env: &lake-env
+  <<: *s3-credentials
+  MINIO_ENDPOINT: http://minio:9000
+  NESSIE_URI: http://nessie:19120/api/v1
+  SPARK_MASTER: spark://spark-master:7077
+
+x-spark-common: &spark-common
+  build:
+    context: .
+    dockerfile: Dockerfile.spark
+  image: fhbd/spark-iceberg:3.5.5
+  # root avoids permission issues on the worker work dir inside the container
+  user: root
+  restart: unless-stopped
+  networks:
+    - lakehouse
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+    args:
+      BASE_IMAGE: ${AIRFLOW_BASE_IMAGE:-apache/airflow:2.10.3-python3.10}
+  image: g2/airflow-spark:2.10.3
+  environment: &airflow-common-env
+    <<: *lake-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__WEBSERVER__SECRET_KEY: 46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+    # Spark connection used by SparkSubmitOperator (host must include the spark:// scheme)
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077, "extra": {"deploy-mode": "client"}}'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    - ./plugins:/opt/airflow/plugins
+    - ./jobs:/opt/airflow/jobs
+    - ./scripts:/opt/airflow/scripts
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - lakehouse
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  # ======================= STORAGE: MinIO (S3) =======================
+  minio:
+    # MinIO stopped publishing community images (registries answer 401/403), so the default
+    # release must already exist locally. Set MINIO_IMAGE in .env to use another image or fork.
+    image: ${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z}
+    pull_policy: missing
+    container_name: g2_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_REGION_NAME: us-east-1
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 768m
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  # Creates the Bronze / Silver / Gold buckets and exits.
+  minio-init:
+    image: ${MINIO_MC_IMAGE:-quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z}
+    pull_policy: missing
+    container_name: g2_minio_init
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set lake http://minio:9000 admin password &&
+      mc mb --ignore-existing lake/bronze lake/silver lake/gold"
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - lakehouse
+
+  # ======================= DATABASE: Postgres (Airflow metadata + Nessie version store) =======================
+  postgres:
+    image: postgres:16
+    container_name: g2_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    mem_limit: 512m
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  # ======================= CATALOG: Nessie (persistent: JDBC on Postgres) =======================
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.77.1
+    container_name: g2_nessie
+    environment:
+      QUARKUS_HTTP_PORT: 19120
+      NESSIE_VERSION_STORE_TYPE: JDBC
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/nessie
+      QUARKUS_DATASOURCE_USERNAME: nessie
+      QUARKUS_DATASOURCE_PASSWORD: nessie
+      JAVA_OPTS_APPEND: -Xmx512m
+    ports:
+      - "19120:19120"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/19120"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    mem_limit: 768m
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  # ======================= PROCESSING: Spark standalone =======================
+  spark-master:
+    <<: *spark-common
+    container_name: g2_spark_master
+    hostname: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      <<: *s3-credentials
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+    ports:
+      - "9090:8080"
+      - "7077:7077"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 768m
+
+  spark-worker:
+    <<: *spark-common
+    container_name: g2_spark_worker
+    # Resolvable hostname: executors advertise it and the driver connects back to it.
+    hostname: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      <<: *s3-credentials
+      SPARK_WORKER_CORES: 3
+      SPARK_WORKER_MEMORY: 4g
+      SPARK_WORKER_WEBUI_PORT: 8081
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 5g
+
+  # ======================= EXPLORATION: Jupyter (same image as Airflow) =======================
+  jupyter:
+    <<: *airflow-common
+    container_name: g2_jupyter
+    hostname: jupyter
+    # Bypass the Airflow entrypoint (it only understands airflow sub-commands)
+    entrypoint:
+      - jupyter
+      - lab
+      - --ip=0.0.0.0
+      - --port=8888
+      - --no-browser
+      - --ServerApp.token=
+      - --ServerApp.password=
+      - --notebook-dir=/opt/airflow/notebooks
+    environment:
+      <<: *lake-env
+      SPARK_DRIVER_HOST: jupyter
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/opt/airflow/notebooks
+      - ./jobs:/opt/airflow/jobs
+      - ./scripts:/opt/airflow/scripts
+      - ./sql:/opt/airflow/sql:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8888/api"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      minio:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    mem_limit: 4g
+    restart: unless-stopped
+
+  # ======================= ORCHESTRATION: Airflow (LocalExecutor) =======================
+  airflow-init:
+    <<: *airflow-common
+    container_name: g2_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/config /sources/jobs
+        chown -R "${AIRFLOW_UID:-50000}:0" /sources/logs /sources/dags /sources/plugins /sources/config /sources/jobs
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    volumes:
+      - .:/sources
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: g2_airflow_webserver
+    command: webserver
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    mem_limit: 1536m
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: g2_airflow_scheduler
+    # With LocalExecutor the Spark driver (client mode) runs here; executors connect back by hostname.
+    hostname: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    mem_limit: 3g
+    restart: unless-stopped
+
+  # ======================= SQL ENGINES: Trino + Dremio =======================
+  trino:
+    image: trinodb/trino:476
+    container_name: g2_trino
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    ports:
+      - "8083:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - ./trino/config.properties:/etc/trino/config.properties:ro
+      - ./trino/jvm.config:/etc/trino/jvm.config:ro
+      - ./sql:/opt/sql:ro
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    mem_limit: 3g
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  dremio:
+    image: dremio/dremio-oss:26.0.5
+    platform: linux/amd64
+    container_name: g2_dremio
+    environment:
+      DREMIO_MAX_HEAP_MEMORY_SIZE_MB: 2048
+      DREMIO_MAX_DIRECT_MEMORY_SIZE_MB: 2048
+      DREMIO_JAVA_SERVER_EXTRA_OPTS: -Dpaths.dist=file:///opt/dremio/data/dist
+    ports:
+      - "9047:9047"
+      - "31010:31010"
+      - "32010:32010"
+    volumes:
+      - dremio-data:/opt/dremio/data
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9047"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    mem_limit: 5g
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  # One-shot: creates the first Dremio user and registers the Nessie catalog as a source.
+  dremio-init:
+    <<: *airflow-common
+    container_name: g2_dremio_init
+    command: ["python", "/opt/airflow/scripts/bootstrap_dremio.py"]
+    environment:
+      DREMIO_URL: http://dremio:9047
+    depends_on:
+      dremio:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  postgres-data:
+  minio-data:
+  dremio-data:
+
+networks:
+  lakehouse:
+    driver: bridge

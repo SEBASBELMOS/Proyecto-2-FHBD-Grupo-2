@@ -1,0 +1,20 @@
+# Data and artifacts
+data/*
+!data/.gitkeep
+*.parquet
+logs/*
+!logs/.gitkeep
+
+# Secrets / local overrides
+.env
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

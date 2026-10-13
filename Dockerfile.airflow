@@ -1,0 +1,47 @@
+# Image shared by Airflow (scheduler/webserver) and Jupyter.
+# It acts as the Spark driver (client mode) for the standalone cluster and also
+# carries dlt (Bronze ingestion), pyarrow/boto3 (manual prep) and JupyterLab.
+#
+# BASE_IMAGE can be overridden (e.g. with an already cached image) through
+# AIRFLOW_BASE_IMAGE in .env; the default is the official image.
+ARG BASE_IMAGE=apache/airflow:2.10.3-python3.10
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Java is required by spark-submit. default-jre-headless exposes an
+# architecture-independent JAVA_HOME (amd64 and arm64).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends default-jre-headless procps \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+
+# Iceberg + Nessie + S3 JARs for the driver. Versions match Dockerfile.spark so
+# driver and executors share the exact same classpath.
+ARG MAVEN=https://repo1.maven.org/maven2
+ADD --chmod=755 ${MAVEN}/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.5.0/iceberg-spark-runtime-3.5_2.12-1.5.0.jar /opt/spark-extra-jars/
+ADD --chmod=755 ${MAVEN}/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.77.1/nessie-spark-extensions-3.5_2.12-0.77.1.jar /opt/spark-extra-jars/
+ADD --chmod=755 ${MAVEN}/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar /opt/spark-extra-jars/
+ADD --chmod=755 ${MAVEN}/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar /opt/spark-extra-jars/
+ADD --chmod=755 ${MAVEN}/software/amazon/awssdk/bundle/2.24.8/bundle-2.24.8.jar /opt/spark-extra-jars/
+ADD --chmod=755 ${MAVEN}/software/amazon/awssdk/url-connection-client/2.24.8/url-connection-client-2.24.8.jar /opt/spark-extra-jars/
+
+USER airflow
+
+# Pin apache-airflow so pip never moves the core while resolving the extra packages.
+# pyspark provides the spark-submit binary used by SparkSubmitOperator.
+RUN pip install --no-cache-dir \
+    "apache-airflow==2.10.3" \
+    "apache-airflow-providers-apache-spark==4.11.3" \
+    "pyspark==3.5.5" \
+    "dlt[filesystem,parquet]==1.30.0" \
+    "boto3>=1.43,<1.44" \
+    "pyarrow==16.1.0" \
+    "jupyterlab==4.6.4" \
+    "nbconvert==7.17.1"
+
+# Put the extra JARs on pyspark's default classpath so the driver finds them
+# without extra spark-submit flags.
+RUN cp /opt/spark-extra-jars/*.jar "$(python -c 'import os, pyspark; print(os.path.join(os.path.dirname(pyspark.__file__), "jars"))')/"
